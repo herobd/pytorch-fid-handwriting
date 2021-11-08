@@ -143,7 +143,19 @@ class InceptionV3(nn.Module):
         outp = []
         x = inp
 
-        if self.resize_input:
+        if self.resize_input=='32':
+            new_len = round(x.size(3)*32/x.size(2))
+            x = F.interpolate(x,
+                              size=(32, new_len),
+                              mode='bilinear',
+                              align_corners=False)
+        elif self.resize_input=='height':
+            new_len = round(x.size(3)*299/x.size(2))
+            x = F.interpolate(x,
+                              size=(299, new_len),
+                              mode='bilinear',
+                              align_corners=False)
+        elif self.resize_input:
             x = F.interpolate(x,
                               size=(299, 299),
                               mode='bilinear',

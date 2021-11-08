@@ -42,6 +42,9 @@ from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
 
 from PIL import Image
+import cv2
+
+EVAL_HEIGHT=299
 
 try:
     from tqdm import tqdm
@@ -63,17 +66,25 @@ parser.add_argument('--dims', type=int, default=2048,
                           'By default, uses pool3 features'))
 parser.add_argument('-c', '--gpu', default='', type=str,
                     help='GPU to use (leave blank for CPU only)')
-
+parser.add_argument('--max-files', type=int, default=999999999,
+                    help='Number of images to actually use from directory')
+parser.add_argument("--crop-first", action="store_true",
+                    help='crop word images in to fit the frame to ink')
 
 def imread(filename):
     """
     Loads an image file into a (height, width, 3) uint8 ndarray.
     """
-    return np.asarray(Image.open(filename), dtype=np.uint8)[..., :3]
+    img = np.asarray(Image.open(filename), dtype=np.uint8)#[..., :3]
+    if len(img.shape)==2:
+        img = np.stack([img,img,img],axis=2)
+    else:
+        img = img[..., :3]
+    return img
 
 
 def get_activations(files, model, batch_size=50, dims=2048,
-                    cuda=False, verbose=False):
+                    cuda=False, verbose=False,crop=False):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
@@ -109,8 +120,42 @@ def get_activations(files, model, batch_size=50, dims=2048,
         start = i
         end = i + batch_size
 
-        images = np.array([imread(str(f)).astype(np.float32)
-                           for f in files[start:end]])
+        if crop:
+            assert(batch_size==1)
+            #print(files[i])
+            im = cv2.imread(str(files[start]),0)
+            if im.shape[0]==0:
+                im = np.ones([299,299])*255
+            else:
+                thr = im<200
+                prof = thr.sum(axis=1)
+                on = np.argwhere(prof)[:,0]
+                if len(on)>0:
+                    top = np.min(on)
+                    bot = np.max(on)
+                    #cv2.imshow('before',im)
+                    #cv2.imwrite('before.png',im)
+                    im = im[top:bot+1,:]
+                im = im[:,:im.shape[1]//2+1] #for double generated words
+                width = im.shape[1] * EVAL_HEIGHT/im.shape[0]
+                im = cv2.resize(im,(round(width),EVAL_HEIGHT))
+                #cv2.imshow('after',im)
+                #cv2.waitKey()
+                #cv2.imwrite('after.png',im)
+                #stall = input('stall')
+
+            images = np.stack([im,im,im],axis=2).astype(np.float32)[None,...]
+            
+        else:
+            images = np.array([imread(str(f)).astype(np.float32)
+                               for f in files[start:end]])
+
+        #ims = [imread(str(f)).astype(np.float32)
+        #                                   for f in files[start:end]]
+        #for file,im in zip(files[start:end],ims):
+        #    print('{} {}'.format(file,im.shape))
+        #images = np.stack([imread(str(f)).astype(np.float32)
+        #                   for f in files[start:end]],axis=0)
 
         # Reshape to (n_images, 3, height, width)
         images = images.transpose((0, 3, 1, 2))
@@ -120,7 +165,9 @@ def get_activations(files, model, batch_size=50, dims=2048,
         if cuda:
             batch = batch.cuda()
 
+        #print('batch: {}'.format(batch.size()))
         pred = model(batch)[0]
+        #print('pred: {}'.format(pred.size()))
 
         # If model output is not scalar, apply global spatial average pooling.
         # This happens if you choose a dimensionality not equal 2048.
@@ -193,7 +240,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def calculate_activation_statistics(files, model, batch_size=50,
-                                    dims=2048, cuda=False, verbose=False):
+                                    dims=2048, cuda=False, verbose=False,crop=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- files       : List of image files paths
@@ -211,13 +258,13 @@ def calculate_activation_statistics(files, model, batch_size=50,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(files, model, batch_size, dims, cuda, verbose)
+    act = get_activations(files, model, batch_size, dims, cuda, verbose,crop=crop)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
 
 
-def _compute_statistics_of_path(path, model, batch_size, dims, cuda):
+def _compute_statistics_of_path(path, model, batch_size, dims, cuda, max_files=99999999999,crop=False):
     if path.endswith('.npz'):
         f = np.load(path)
         m, s = f['mu'][:], f['sigma'][:]
@@ -225,28 +272,36 @@ def _compute_statistics_of_path(path, model, batch_size, dims, cuda):
     else:
         path = pathlib.Path(path)
         files = list(path.glob('*.jpg')) + list(path.glob('*.png'))
+        files = files[:max_files]
         m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, cuda)
+                                               dims, cuda,crop=crop)
 
     return m, s
 
 
-def calculate_fid_given_paths(paths, batch_size, cuda, dims):
+def calculate_fid_given_paths(paths, batch_size, cuda, dims, max_files=99999999999,crop_first=False):
     """Calculates the FID of two paths"""
     for p in paths:
         if not os.path.exists(p):
             raise RuntimeError('Invalid path: %s' % p)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-
-    model = InceptionV3([block_idx])
+    
+    if EVAL_HEIGHT==299:
+        resize_input='height'
+    elif EVAL_HEIGHT==32:
+        resize_input='32'
+    else:
+        resize_input=None
+        
+    model = InceptionV3([block_idx],resize_input=resize_input)
     if cuda:
         model.cuda()
 
     m1, s1 = _compute_statistics_of_path(paths[0], model, batch_size,
-                                         dims, cuda)
+                                         dims, cuda, max_files, crop=crop_first)
     m2, s2 = _compute_statistics_of_path(paths[1], model, batch_size,
-                                         dims, cuda)
+                                         dims, cuda, max_files)
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
 
     return fid_value
@@ -259,5 +314,7 @@ if __name__ == '__main__':
     fid_value = calculate_fid_given_paths(args.path,
                                           args.batch_size,
                                           args.gpu != '',
-                                          args.dims)
+                                          args.dims,
+                                          args.max_files,
+                                          args.crop_first)
     print('FID: ', fid_value)
